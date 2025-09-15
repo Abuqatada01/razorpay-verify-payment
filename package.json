@@ -1,0 +1,19 @@
+{
+  "name": "razorpay-verify-payment",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "crypto": "^1.0.1",
+    "node-appwrite": "^19.0.0",
+    "process": "^0.11.10",
+    "razorpay": "^2.9.6"
+  }
+}

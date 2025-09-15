@@ -1,28 +1,32 @@
-// verify-payment/index.js
+// create-order/index.js
 require('dotenv').config();
-const crypto = require('crypto');
-const { Client, Databases } = require('node-appwrite');
+const Razorpay = require('razorpay');
+const { Client, Databases, ID } = require('node-appwrite');
 
 (async function main() {
     try {
+        // Parse payload
         let payload = {};
         if (process.env.APPWRITE_FUNCTION_DATA) {
             try {
                 payload = JSON.parse(process.env.APPWRITE_FUNCTION_DATA);
             } catch (e) {
-                console.log(JSON.stringify({ success: false, message: 'invalid APPWRITE_FUNCTION_DATA' }));
+                console.log(JSON.stringify({ success: false, message: 'invalid function data', error: String(e) }));
                 process.exit(1);
             }
-        }
-
-        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, localOrderId } = payload;
-
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !localOrderId) {
-            console.log(JSON.stringify({ success: false, message: 'missing verification fields', payload }));
+        } else {
+            console.log(JSON.stringify({ success: false, message: 'missing function payload' }));
             process.exit(1);
         }
 
-        // Required envs
+        const { amount, currency = 'INR', receipt, userId, items } = payload;
+        if (!amount || !userId) {
+            console.log(JSON.stringify({ success: false, message: 'amount and userId required', payload }));
+            process.exit(1);
+        }
+
+        // Env validation - check both function context and regular env vars
+        const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
         const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
         const APPWRITE_ENDPOINT = process.env.APPWRITE_FUNCTION_ENDPOINT || process.env.APPWRITE_ENDPOINT;
         const APPWRITE_PROJECT = process.env.APPWRITE_FUNCTION_PROJECT_ID || process.env.APPWRITE_PROJECT_ID;
@@ -30,39 +34,103 @@ const { Client, Databases } = require('node-appwrite');
         const DATABASE_ID = process.env.APPWRITE_DATABASE_ID;
         const ORDERS_COLLECTION_ID = process.env.APPWRITE_ORDERS_COLLECTION_ID;
 
-        if (!RAZORPAY_KEY_SECRET) throw new Error('Missing RAZORPAY_KEY_SECRET');
-        if (!APPWRITE_ENDPOINT || !APPWRITE_PROJECT || !APPWRITE_API_KEY) throw new Error('Missing Appwrite config');
+        // Log env status for debugging (don't log actual keys)
+        console.log(JSON.stringify({
+            info: 'env check',
+            hasRazorpayId: !!RAZORPAY_KEY_ID,
+            hasRazorpaySecret: !!RAZORPAY_KEY_SECRET,
+            hasAppwriteEndpoint: !!APPWRITE_ENDPOINT,
+            hasAppwriteProject: !!APPWRITE_PROJECT,
+            hasAppwriteApiKey: !!APPWRITE_API_KEY,
+            hasDatabaseId: !!DATABASE_ID,
+            hasOrdersCollectionId: !!ORDERS_COLLECTION_ID
+        }));
 
-        // Verify signature
-        const signatureData = `${razorpay_order_id}|${razorpay_payment_id}`;
-        const expectedSignature = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET).update(signatureData).digest('hex');
-        const verified = expectedSignature === razorpay_signature;
-
-        // Appwrite client
-        const client = new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT).setKey(APPWRITE_API_KEY);
-        const databases = new Databases(client);
-
-        // Only update fields that exist in your collection
-        const updateDoc = {
-            status: verified ? 'paid' : 'payment_failed',
-            razorpay_payment_id,
-            razorpay_signature,
-            // Do NOT send updatedAt, Appwrite auto-manages $updatedAt
-        };
-
-        const updated = await databases.updateDocument(DATABASE_ID, ORDERS_COLLECTION_ID, localOrderId, updateDoc);
-        console.log('Order updated:', updated.$id);
-
-        if (verified) {
-            console.log(JSON.stringify({ success: true, message: 'payment verified', localOrderId }));
-            process.exit(0);
-        } else {
-            console.log(JSON.stringify({ success: false, message: 'signature mismatch', localOrderId }));
+        if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+            console.log(JSON.stringify({ success: false, message: 'missing razorpay keys' }));
             process.exit(1);
         }
+        if (!APPWRITE_ENDPOINT || !APPWRITE_PROJECT || !APPWRITE_API_KEY) {
+            console.log(JSON.stringify({ success: false, message: 'missing appwrite server config' }));
+            process.exit(1);
+        }
+        if (!DATABASE_ID || !ORDERS_COLLECTION_ID) {
+            console.log(JSON.stringify({ success: false, message: 'missing database/collection ids' }));
+            process.exit(1);
+        }
+
+        // Create Razorpay order
+        const razor = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+        const amountPaise = Math.round(Number(amount) * 100);
+        const orderOptions = {
+            amount: amountPaise,
+            currency,
+            receipt: receipt || `rcpt_${Date.now()}`,
+            payment_capture: 1,
+            notes: { appwriteUserId: userId },
+        };
+
+        console.log(JSON.stringify({ info: 'creating razorpay order', amount: amountPaise, currency }));
+        const razorOrder = await razor.orders.create(orderOptions);
+        console.log(JSON.stringify({ info: 'razorpay order created', orderId: razorOrder.id }));
+
+        // Init Appwrite SDK
+        const client = new Client()
+            .setEndpoint(APPWRITE_ENDPOINT)
+            .setProject(APPWRITE_PROJECT)
+            .setKey(APPWRITE_API_KEY);
+
+        const databases = new Databases(client);
+
+        // Prepare items array - ensure each item fits your schema constraints
+        const itemsIds = Array.isArray(items)
+            ? items.map(item => {
+                if (typeof item === 'string') return item.slice(0, 499);
+                if (item && item.productId) return String(item.productId).slice(0, 499);
+                return String(item).slice(0, 499);
+            }).filter(Boolean)
+            : [];
+
+        // Store complete items data as JSON for later reference
+        const itemsJson = JSON.stringify(items || []);
+
+        // Create order document - match your collection schema exactly
+        const localOrder = {
+            userId,
+            items: itemsIds,          // Array of strings, each max 499 chars
+            amount: Number(amount),   // Ensure it's a number
+            currency,
+            receipt: orderOptions.receipt,
+            razorpay_order_id: razorOrder.id,
+            status: 'created',
+            items_json: itemsJson,    // Full JSON data
+            // Don't include $createdAt - Appwrite manages this automatically
+        };
+
+        console.log(JSON.stringify({ info: 'creating appwrite order doc', itemsCount: itemsIds.length }));
+        const orderDoc = await databases.createDocument(DATABASE_ID, ORDERS_COLLECTION_ID, ID.unique(), localOrder);
+        console.log(JSON.stringify({ info: 'appwrite order created', docId: orderDoc.$id }));
+
+        // Success response
+        const result = {
+            success: true,
+            razorOrder,
+            localOrderId: orderDoc.$id
+        };
+        console.log(JSON.stringify(result));
+        process.exit(0);
+
     } catch (err) {
-        console.error('verify-payment error:', err && (err.stack || err.message || err));
-        console.log(JSON.stringify({ success: false, message: String(err?.message || err) }));
+        // Enhanced error logging
+        const errorInfo = {
+            success: false,
+            message: err.message || String(err),
+            errorType: err.constructor.name,
+            stack: err.stack
+        };
+
+        console.error('create-order error details:', errorInfo);
+        console.log(JSON.stringify({ success: false, message: errorInfo.message }));
         process.exit(1);
     }
 })();

@@ -1,10 +1,27 @@
-// index.js (verify-payment function)
+// verify-payment/index.js
+// Node 16+ Appwrite Function
+require('dotenv').config();
 const crypto = require('crypto');
-const sdk = require('node-appwrite');
+const { Client, Databases } = require('node-appwrite');
 
-module.exports = async function (req, res) {
+(async function main() {
     try {
-        const payload = req.payload ? JSON.parse(req.payload) : {};
+        // 0) Read payload (Appwrite passes JSON string in APPWRITE_FUNCTION_DATA)
+        let payload = {};
+        if (process.env.APPWRITE_FUNCTION_DATA) {
+            try {
+                payload = JSON.parse(process.env.APPWRITE_FUNCTION_DATA);
+            } catch (e) {
+                console.error('Invalid APPWRITE_FUNCTION_DATA:', e);
+                console.log(JSON.stringify({ success: false, message: 'invalid function data' }));
+                process.exit(1);
+            }
+        } else {
+            console.log(JSON.stringify({ success: false, message: 'missing function payload' }));
+            process.exit(1);
+        }
+
+        // 1) Extract fields we expect from payload
         const {
             razorpay_order_id,
             razorpay_payment_id,
@@ -12,58 +29,79 @@ module.exports = async function (req, res) {
             localOrderId
         } = payload;
 
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-            return res.json({ success: false, message: 'missing params' }, 400);
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !localOrderId) {
+            console.error('Missing verification fields', { payload });
+            console.log(JSON.stringify({ success: false, message: 'missing verification fields' }));
+            process.exit(1);
         }
 
-        // compute expected signature
-        const generated_signature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-            .update(razorpay_order_id + '|' + razorpay_payment_id)
-            .digest('hex');
+        // 2) Env / config (set these in Function settings)
+        const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+        const APPWRITE_ENDPOINT = process.env.APPWRITE_FUNCTION_ENDPOINT || process.env.APPWRITE_ENDPOINT;
+        const APPWRITE_PROJECT = process.env.APPWRITE_FUNCTION_PROJECT_ID || process.env.APPWRITE_PROJECT_ID;
+        const APPWRITE_API_KEY = process.env.APPWRITE_FUNCTION_API_KEY || process.env.APPWRITE_API_KEY;
+        const DATABASE_ID = process.env.APPWRITE_DATABASE_ID;
+        const ORDERS_COLLECTION_ID = process.env.APPWRITE_ORDERS_COLLECTION_ID;
 
-        const isValid = generated_signature === razorpay_signature;
+        if (!RAZORPAY_KEY_SECRET) throw new Error('Missing RAZORPAY_KEY_SECRET in function env');
+        if (!APPWRITE_ENDPOINT || !APPWRITE_PROJECT || !APPWRITE_API_KEY) throw new Error('Missing Appwrite server config');
+        if (!DATABASE_ID || !ORDERS_COLLECTION_ID) throw new Error('Missing database/collection IDs');
 
-        // init Appwrite client to update the order doc
-        const client = new sdk.Client()
-            .setEndpoint(process.env.APPWRITE_FUNCTION_ENDPOINT || process.env.APPWRITE_ENDPOINT)
-            .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID || process.env.APPWRITE_PROJECT_ID)
-            .setKey(process.env.APPWRITE_FUNCTION_API_KEY || process.env.APPWRITE_API_KEY);
-        const databases = new sdk.Databases(client);
+        // 3) Verify signature: expected = HMAC_SHA256(order_id + "|" + payment_id, secret)
+        const signatureData = `${razorpay_order_id}|${razorpay_payment_id}`;
+        const expectedSignature = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET).update(signatureData).digest('hex');
+        const verified = expectedSignature === razorpay_signature;
 
-        if (isValid) {
-            // update order document to paid
-            if (localOrderId) {
-                await databases.updateDocument(
-                    process.env.APPWRITE_DATABASE_ID,
-                    process.env.APPWRITE_ORDERS_COLLECTION_ID,
-                    localOrderId,
-                    {
-                        razorpay_payment_id,
-                        razorpay_signature,
-                        status: 'paid',
-                        paidAt: new Date().toISOString()
-                    }
-                );
-            }
-            return res.json({ success: true, message: 'Payment verified' });
+        // 4) Initialize Appwrite server SDK (use server key)
+        const client = new Client()
+            .setEndpoint(APPWRITE_ENDPOINT)
+            .setProject(APPWRITE_PROJECT)
+            .setKey(APPWRITE_API_KEY);
+
+        const databases = new Databases(client);
+
+        // 5) Build safe update object
+        // Only include attributes your Appwrite collection accepts. If your collection doesn't
+        // have some fields, either add them in Console or remove them here.
+        const updateDoc = {
+            status: verified ? 'paid' : 'payment_failed',
+            razorpay_payment_id,
+            razorpay_signature,
+            verification_raw: JSON.stringify({
+                signatureData,
+                expectedSignature,
+                providedSignature: razorpay_signature,
+                verified,
+                timestamp: new Date().toISOString()
+            })
+        };
+
+        // 6) Update the order document in Appwrite
+        try {
+            const updated = await databases.updateDocument(
+                DATABASE_ID,
+                ORDERS_COLLECTION_ID,
+                localOrderId,
+                updateDoc
+            );
+            console.log('Order updated:', updated.$id);
+        } catch (err) {
+            console.error('Failed to update Appwrite order:', err);
+            console.log(JSON.stringify({ success: false, message: 'failed to update order', error: String(err) }));
+            process.exit(1);
+        }
+
+        // 7) Return result
+        if (verified) {
+            console.log(JSON.stringify({ success: true, message: 'payment verified', localOrderId }));
+            process.exit(0);
         } else {
-            if (localOrderId) {
-                await databases.updateDocument(
-                    process.env.APPWRITE_DATABASE_ID,
-                    process.env.APPWRITE_ORDERS_COLLECTION_ID,
-                    localOrderId,
-                    {
-                        razorpay_payment_id,
-                        razorpay_signature,
-                        status: 'failed',
-                        updatedAt: new Date().toISOString()
-                    }
-                );
-            }
-            return res.json({ success: false, message: 'Invalid signature' }, 400);
+            console.log(JSON.stringify({ success: false, message: 'signature mismatch', localOrderId }));
+            process.exit(1);
         }
     } catch (err) {
-        console.error('verify-payment error', err);
-        return res.json({ success: false, message: err.message || err.toString() }, 500);
+        console.error('verify-payment error:', err && (err.stack || err.message || err));
+        console.log(JSON.stringify({ success: false, message: String(err && err.message ? err.message : err) }));
+        process.exit(1);
     }
-};
+})();

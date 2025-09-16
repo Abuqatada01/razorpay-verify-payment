@@ -60,7 +60,7 @@ export default async ({ req, res, log, error }) => {
             // ✅ Save extended order in Appwrite DB
             const savedOrder = await databases.createDocument(
                 "68c414290032f31187eb", // Database ID
-                "68c8567e001a18aefff0", // Orders collection
+                "68c58bfe0001e9581bd4", // Orders collection
                 ID.unique(),
                 {
                     userId: userId,              // 👈 match schema exactly

@@ -9,14 +9,14 @@ export default async ({ req, res, log, error }) => {
         const client = new Client()
             .setEndpoint("https://fra.cloud.appwrite.io/v1")
             .setProject("684c05fe002863accd73")
-            .setKey(req.headers['x-appwrite-key']);
+            .setKey(req.headers["x-appwrite-key"]);
 
         const databases = new Databases(client);
 
         // ✅ Razorpay client
         const razorpay = new Razorpay({
-            key_id: "rzp_test_RH8HdkZbA9xnoK",
-            key_secret: "V2OIX2UM8B6CGlxk0UjzQmk1",
+            key_id: process.env.RAZORPAY_KEY_ID || "rzp_test_RH8HdkZbA9xnoK",
+            key_secret: process.env.RAZORPAY_KEY_SECRET || "V2OIX2UM8B6CGlxk0UjzQmk1",
         });
 
         if (req.method === "POST") {
@@ -30,38 +30,50 @@ export default async ({ req, res, log, error }) => {
                 return res.json({ success: false, message: "Invalid JSON" }, 400);
             }
 
-            const { productId, amount } = bodyData;
-            if (!productId || !amount) {
+            const { userId, items = [], amount, currency = "INR" } = bodyData;
+            if (!userId || !amount) {
                 return res.json(
-                    { success: false, message: "productId and amount required" },
+                    { success: false, message: "userId and amount required" },
                     400
                 );
             }
+
             // Ensure amount is integer
             const intAmount = parseInt(amount, 10);
             if (isNaN(intAmount)) {
-                return res.json({ success: false, message: "Amount must be a number" }, 400);
+                return res.json(
+                    { success: false, message: "Amount must be a number" },
+                    400
+                );
             }
+
             // ✅ Create Razorpay order
             const order = await razorpay.orders.create({
-                amount: intAmount * 100, // paise
-                currency: "INR",
+                amount: intAmount * 100, // in paise
+                currency,
                 receipt: `receipt_${Date.now()}`,
             });
 
             log("✅ Razorpay order created");
 
-            // ✅ Save minimal order in Appwrite DB
+            // ✅ Save extended order in Appwrite DB
             const savedOrder = await databases.createDocument(
-                "68c414290032f31187eb",
-                "68c8567e001a18aefff0",
+                "68c414290032f31187eb", // Database ID
+                "68c8567e001a18aefff0", // Orders collection
                 ID.unique(),
                 {
-                    productId,
-                    amount: intAmount, // ✅ saved as integer
-                    orderId: order.id,
-                    paymentId: null,
+                    userId,
+                    items,
+                    amount: intAmount,
+                    amountPaise: order.amount, // save in paise too
+                    currency: order.currency,
+                    razorpay_order_id: order.id,
+                    razorpay_payment_id: null, // will be updated after payment success
+                    razorpay_signature: null,
                     status: "unpaid",
+                    receipt: order.receipt,
+                    items_json: JSON.stringify(items),
+                    verification_raw: null,
                 }
             );
 

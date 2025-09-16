@@ -57,18 +57,19 @@ export default async ({ req, res, log, error }) => {
             log("✅ Razorpay order created");
 
             // ✅ Save extended order in Appwrite DB
+            // ✅ Save extended order in Appwrite DB
             const savedOrder = await databases.createDocument(
                 "68c414290032f31187eb", // Database ID
                 "68c8567e001a18aefff0", // Orders collection
                 ID.unique(),
                 {
-                    userId,
+                    user_id: userId,              // 👈 match schema exactly
                     items,
                     amount: intAmount,
-                    amountPaise: order.amount, // save in paise too
+                    amountPaise: order.amount,
                     currency: order.currency,
                     razorpay_order_id: order.id,
-                    razorpay_payment_id: null, // will be updated after payment success
+                    razorpay_payment_id: null,
                     razorpay_signature: null,
                     status: "unpaid",
                     receipt: order.receipt,
@@ -76,6 +77,7 @@ export default async ({ req, res, log, error }) => {
                     verification_raw: null,
                 }
             );
+
 
             log("✅ Order saved in Appwrite DB");
 

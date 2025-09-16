@@ -108,7 +108,7 @@ export default async ({ req, res, log, error }) => {
             items: Array.isArray(items) ? items.map(it => (it && typeof it === "object" ? `${it.name || it.title || it.productId}${it.size ? ` (Size: ${it.size})` : ""}` : String(it))) : [],
             size: Array.isArray(items) && items[0]?.size ? String(items[0].size) : null,
             verification_raw: JSON.stringify({ paymentDetails }),
-            createdAt: new Date().toISOString(),
+            // createdAt: new Date().toISOString(),
         };
 
         let saved = null;

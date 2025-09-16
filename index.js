@@ -135,36 +135,49 @@
 //         process.exit(1);
 //     }
 // })();
-import { Client } from 'node-appwrite';
+import { Client } from "node-appwrite";
 
-// This is your Appwrite function
-// It's executed each time we get a request
 export default async ({ req, res, log, error }) => {
-    // Why not try the Appwrite SDK?
-    //
-    // Set project and set API key
-    // const client = new Client()
-    //    .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
-    //    .setKey(req.headers['x-appwrite-key']);
+    try {
+        log("Function execution started ✅");
 
-    // You can log messages to the console
-    log('Hello, Logs!');
+        // Example: Setup Appwrite client if needed
+        // const client = new Client()
+        //   .setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT) // Required if calling Appwrite services
+        //   .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
+        //   .setKey(process.env.APPWRITE_API_KEY);
 
-    // If something goes wrong, log an error
-    error('Hello, Errors!');
+        if (req.method === "GET") {
+            log("GET request received");
+            return res.text("Hello, World!");
+        }
 
-    // The `req` object contains the request data
-    if (req.method === 'GET') {
-        // Send a response with the res object helpers
-        // `res.text()` dispatches a string back to the client
-        return res.text('Hello, World!');
+        if (req.method === "POST") {
+            log("POST request received");
+
+            // Parse body if exists
+            let bodyData = {};
+            try {
+                bodyData = JSON.parse(req.bodyRaw || "{}");
+            } catch (parseError) {
+                error("Invalid JSON body");
+                return res.json({ success: false, message: "Invalid JSON" }, 400);
+            }
+
+            return res.json({
+                success: true,
+                message: "POST request successful",
+                received: bodyData,
+            });
+        }
+
+        // Handle unsupported methods
+        return res.json(
+            { success: false, message: `Method ${req.method} not allowed` },
+            405
+        );
+    } catch (err) {
+        error("Unexpected error: " + err.message);
+        return res.json({ success: false, error: err.message }, 500);
     }
-
-    // `res.json()` is a handy helper for sending JSON
-    return res.json({
-        motto: 'Build like a team of hundreds_',
-        learn: 'https://appwrite.io/docs',
-        connect: 'https://appwrite.io/discord',
-        getInspired: 'https://builtwith.appwrite.io',
-    });
 };

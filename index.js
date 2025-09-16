@@ -1,51 +1,77 @@
 import Razorpay from "razorpay";
+import { Client, Databases, ID } from "node-appwrite";
 
 export default async ({ req, res, log, error }) => {
     try {
-        log("Razorpay Function execution started ✅");
+        log("⚡ Razorpay Function execution started");
 
-        // ✅ Initialize Razorpay instance
+        // ✅ Appwrite client
+        const client = new Client()
+            .setEndpoint("https://fra.cloud.appwrite.io/v1")
+            .setProject("684c05fe002863accd73")
+            .setKey(req.headers['x-appwrite-key']);
+
+        const databases = new Databases(client);
+
+        // ✅ Razorpay client
         const razorpay = new Razorpay({
-            key_id: "rzp_test_RH8HdkZbA9xnoK",       // Add in Appwrite Function Variables
+            key_id: "rzp_test_RH8HdkZbA9xnoK",
             key_secret: "V2OIX2UM8B6CGlxk0UjzQmk1",
         });
 
         if (req.method === "POST") {
-            log("POST request received for Razorpay order");
+            log("📩 POST request received for Razorpay order");
 
-            // Parse body to extract amount & currency
+            // Parse request
             let bodyData = {};
             try {
                 bodyData = JSON.parse(req.bodyRaw || "{}");
-            } catch (parseError) {
-                error("Invalid JSON body");
+            } catch {
                 return res.json({ success: false, message: "Invalid JSON" }, 400);
             }
 
-            const { amount, currency = "INR", receipt = "receipt_1" } = bodyData;
-
-            if (!amount) {
-                return res.json({ success: false, message: "Amount is required" }, 400);
+            const { productId, amount } = bodyData;
+            if (!productId || !amount) {
+                return res.json(
+                    { success: false, message: "productId and amount required" },
+                    400
+                );
             }
 
             // ✅ Create Razorpay order
-            const options = {
-                amount: amount * 100, // convert to paise
-                currency,
-                receipt,
-            };
+            const order = await razorpay.orders.create({
+                amount: amount * 100, // paise
+                currency: "INR",
+                receipt: `receipt_${Date.now()}`,
+            });
 
-            const order = await razorpay.orders.create(options);
+            log("✅ Razorpay order created");
 
-            log("Razorpay order created successfully");
+            // ✅ Save minimal order in Appwrite DB
+            const savedOrder = await databases.createDocument(
+                "68c414290032f31187eb",
+                "68c8567e001a18aefff0", // Orders collection
+                ID.unique(),
+                {
+                    productId,
+                    amount,
+                    orderId: order.id,
+                    paymentId: null, // will be updated later after success
+                    status: "unpaid",
+                }
+            );
+
+            log("✅ Order saved in Appwrite DB");
+
             return res.json({
                 success: true,
                 order,
+                dbRecord: savedOrder,
             });
         }
 
         if (req.method === "GET") {
-            return res.text("Razorpay Appwrite Function is live 🚀");
+            return res.text("🚀 Razorpay Appwrite Function is live");
         }
 
         return res.json(

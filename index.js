@@ -63,7 +63,7 @@ export default async ({ req, res, log, error }) => {
                 "68c8567e001a18aefff0", // Orders collection
                 ID.unique(),
                 {
-                    user_id: userId,              // 👈 match schema exactly
+                    userId: userId,              // 👈 match schema exactly
                     items,
                     amount: intAmount,
                     amountPaise: order.amount,

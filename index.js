@@ -37,10 +37,14 @@ export default async ({ req, res, log, error }) => {
                     400
                 );
             }
-
+            // Ensure amount is integer
+            const intAmount = parseInt(amount, 10);
+            if (isNaN(intAmount)) {
+                return res.json({ success: false, message: "Amount must be a number" }, 400);
+            }
             // ✅ Create Razorpay order
             const order = await razorpay.orders.create({
-                amount: amount * 100, // paise
+                amount: intAmount * 100, // paise
                 currency: "INR",
                 receipt: `receipt_${Date.now()}`,
             });
@@ -50,13 +54,13 @@ export default async ({ req, res, log, error }) => {
             // ✅ Save minimal order in Appwrite DB
             const savedOrder = await databases.createDocument(
                 "68c414290032f31187eb",
-                "68c8567e001a18aefff0", // Orders collection
+                "68c8567e001a18aefff0",
                 ID.unique(),
                 {
                     productId,
-                    amount,
+                    amount: intAmount, // ✅ saved as integer
                     orderId: order.id,
-                    paymentId: null, // will be updated later after success
+                    paymentId: null,
                     status: "unpaid",
                 }
             );

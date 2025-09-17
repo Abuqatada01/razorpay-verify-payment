@@ -1,161 +1,108 @@
-// verifyPayment.js - verifies Razorpay signature and updates/creates order doc (includes shipping + size)
+// createOrder.js (Appwrite Function) - Create order for COD or Razorpay and save shipping as short string + shipping_json
+// ESM-compatible (node-appwrite named exports)
 import Razorpay from "razorpay";
-import { Client, Databases, Query, ID } from "node-appwrite";
-import crypto from "crypto";
+import { Client as AppwriteClient, Databases, Query, ID } from "node-appwrite";
 
-/** safe JSON parse that tolerates strings/objects */
-const safeParse = (raw) => {
-    try {
-        if (!raw) return {};
-        if (typeof raw === "string") return JSON.parse(raw);
-        if (typeof raw === "object") return raw;
-    } catch {
-        try {
-            return JSON.parse(String(raw || "{}"));
-        } catch {
-            return {};
-        }
-    }
-    return {};
-};
-
-const makeRazorpayClient = () => {
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keyId || !keySecret) {
-        throw new Error("Missing Razorpay credentials in function env (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET)");
-    }
-    return new Razorpay({ key_id: keyId, key_secret: keySecret });
-};
+const createRazorpayClient = () =>
+    new Razorpay({
+        key_id: process.env.RAZORPAY_KEY_ID,
+        key_secret: process.env.RAZORPAY_KEY_SECRET,
+    });
 
 const normalizeStr = (v) => (typeof v === "string" ? v.trim() : v);
+const TRUNCATE_ITEM = 9999; // for items elements (Appwrite limit you experienced)
+const TRUNCATE_SHIPPING = 999; // shipping column limit per your error
+
+const stringifyItem = (it) => {
+    try {
+        if (it === null || typeof it === "undefined") return "";
+        if (typeof it === "string") return it.slice(0, TRUNCATE_ITEM);
+        if (typeof it === "number" || typeof it === "boolean") return String(it).slice(0, TRUNCATE_ITEM);
+
+        // object: create readable label
+        const name = it.name || it.title || it.productId || it.id || "item";
+        const price = (typeof it.price !== "undefined" ? it.price : it.amount) || null;
+        const size = it.size || it.s || it.sizeOption || it.item_size || null;
+        const sizeLabel = size ? ` (Size: ${size})` : "";
+        const priceLabel = price ? ` - ₹${price}` : "";
+        const label = `${name}${sizeLabel}${priceLabel}`;
+        const final = label && label.length > 3 ? label : JSON.stringify(it || {});
+        return final.length > TRUNCATE_ITEM ? final.slice(0, TRUNCATE_ITEM) : final;
+    } catch (e) {
+        const s = JSON.stringify(it || {});
+        return s.length > TRUNCATE_ITEM ? s.slice(0, TRUNCATE_ITEM) : s;
+    }
+};
+
+// Build a short human-readable shipping string (for shipping column)
+const buildShippingShort = (s) => {
+    try {
+        if (!s) return "";
+        const parts = [];
+        if (s.fullName || s.full_name) parts.push(s.fullName || s.full_name);
+        if (s.line1 || s.line_1) parts.push(s.line1 || s.line_1);
+        if (s.line2 || s.line_2) parts.push(s.line2 || s.line_2);
+        if (s.city) parts.push(s.city);
+        if (s.state) parts.push(s.state);
+        if (s.postalCode || s.postal_code) parts.push(s.postalCode || s.postal_code);
+        if (s.phone) parts.push(`Ph: ${s.phone}`);
+        const joined = parts.join(", ");
+        return joined.length > TRUNCATE_SHIPPING ? joined.slice(0, TRUNCATE_SHIPPING) : joined;
+    } catch {
+        return String(s).slice(0, TRUNCATE_SHIPPING);
+    }
+};
 
 export default async ({ req, res, log, error }) => {
-    log("verifyPayment invoked");
     try {
-        if (req.method !== "POST") return res.json({ success: false, message: "Method not allowed" }, 405);
+        log("⚡ createOrder function started");
 
-        // Accept many payload shapes
-        const raw =
-            req.bodyRaw ||
-            req.payload ||
-            req.variables?.APPWRITE_FUNCTION_DATA ||
-            req.headers?.["x-appwrite-function-data"] ||
-            "{}";
+        if (req.method !== "POST") {
+            if (req.method === "GET") return res.text("createOrder function is live");
+            return res.json({ success: false, message: `Method ${req.method} not allowed` }, 405);
+        }
 
-        let bodyData = safeParse(raw);
-        if (typeof bodyData.body === "string") Object.assign(bodyData, safeParse(bodyData.body));
-        if (typeof bodyData.data === "string") Object.assign(bodyData, safeParse(bodyData.data));
+        const body = (() => {
+            try {
+                return JSON.parse(req.bodyRaw || "{}");
+            } catch {
+                return {};
+            }
+        })();
 
-        // prefer top-level keys (client should send these)
+        // Accept both camelCase and snake_case client keys
         const {
-            razorpay_order_id,
-            razorpay_payment_id,
-            razorpay_signature,
-            userId,
-            items,
-            amount: amountFromClient,
+            amount,
             currency = "INR",
-            shipping: shippingFromClient,
-            shippingPrimaryIndex,
-        } = bodyData || {};
+            userId,
+            items = [],
+            paymentMethod,
+            payment_method,
+            shipping = null,
+            shippingPrimaryIndex = 0,
+        } = body || {};
 
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-            return res.json({ success: false, message: "Missing required payment fields" }, 400);
+        const pm = (paymentMethod || payment_method || "razorpay").toLowerCase();
+
+        // REQUIRE userId if your collection enforces it
+        if (!userId) {
+            return res.json({ success: false, message: "userId is required. Please login and send userId." }, 400);
         }
 
-        // Ensure Razorpay env exists
-        if (!process.env.RAZORPAY_KEY_SECRET || !process.env.RAZORPAY_KEY_ID) {
-            error("Missing Razorpay env vars");
-            return res.json({ success: false, message: "Server misconfiguration: missing Razorpay credentials" }, 500);
-        }
-
-        // Verify signature
-        const generatedSignature = crypto
-            .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-            .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-            .digest("hex");
-
-        if (generatedSignature !== razorpay_signature) {
-            log("Signature mismatch", { generatedSignature, razorpay_signature });
-            return res.json({ success: false, message: "Invalid signature" }, 400);
-        }
-
-        // Instantiate Razorpay client
-        const razorpay = makeRazorpayClient();
-
-        // Try to fetch payment details (non-fatal)
-        let paymentDetails = null;
-        try {
-            paymentDetails = await razorpay.payments.fetch(razorpay_payment_id);
-            log("Fetched payment details:", paymentDetails?.id);
-        } catch (fetchErr) {
-            log("Could not fetch payment details:", fetchErr.message || fetchErr);
-        }
-
-        // Optional amount verification
-        if (typeof amountFromClient !== "undefined" && paymentDetails?.amount !== undefined) {
-            let expectedPaise = Number(amountFromClient);
-            // Try to detect rupees vs paise
-            if (expectedPaise > 1000000) {
-                // probably already paise
-            } else if (expectedPaise < 1000) {
-                // small rupee value -> convert
-                expectedPaise = Math.round(expectedPaise * 100);
-            } else {
-                // ambiguous rupee value: convert to paise
-                expectedPaise = Math.round(expectedPaise * 100);
-            }
-            if (Number(paymentDetails.amount) !== expectedPaise) {
-                log("Amount mismatch", { expectedPaise, actual: paymentDetails.amount });
-                return res.json({ success: false, message: "Payment amount mismatch" }, 400);
-            }
-        }
-
-        // Appwrite init
-        const APPWRITE_ENDPOINT = process.env.APPWRITE_ENDPOINT;
-        const APPWRITE_PROJECT_ID = process.env.APPWRITE_PROJECT_ID;
-        // Accept x-appwrite-key header for admin key (preferred), else fallback to env var
-        const APPWRITE_API_KEY = req.headers?.["x-appwrite-key"] || process.env.APPWRITE_API_KEY;
-        const APPWRITE_DATABASE_ID = process.env.APPWRITE_DATABASE_ID;
-        const APPWRITE_ORDERS_COLLECTION_ID = process.env.APPWRITE_ORDERS_COLLECTION_ID;
-
-        if (!APPWRITE_ENDPOINT || !APPWRITE_PROJECT_ID || !APPWRITE_API_KEY || !APPWRITE_DATABASE_ID || !APPWRITE_ORDERS_COLLECTION_ID) {
-            error("Missing Appwrite DB env vars");
-            return res.json({ success: false, message: "Server misconfiguration: missing Appwrite config" }, 500);
-        }
-
-        const client = new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT_ID).setKey(APPWRITE_API_KEY);
-        const databases = new Databases(client);
-
-        // Find existing order doc by razorpay_order_id
-        let existingDoc = null;
-        try {
-            const listRes = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, [
-                Query.equal("razorpay_order_id", razorpay_order_id),
-                Query.limit(1),
-            ]);
-            existingDoc = listRes.documents?.[0] || null;
-        } catch (listErr) {
-            log("listDocuments error (continuing):", listErr.message || listErr);
-        }
-
-        // Normalize shipping: prefer existing doc shipping, then client-provided shipping, else empty array
+        // Normalize shipping into array
         let shippingArray = [];
-        if (existingDoc && existingDoc.shipping) {
-            if (Array.isArray(existingDoc.shipping)) shippingArray = existingDoc.shipping;
-            else if (existingDoc.shipping && typeof existingDoc.shipping === "object") shippingArray = [existingDoc.shipping];
-        } else if (shippingFromClient) {
-            if (Array.isArray(shippingFromClient)) shippingArray = shippingFromClient;
-            else if (shippingFromClient && typeof shippingFromClient === "object") shippingArray = [shippingFromClient];
-        } else {
-            shippingArray = [];
+        if (Array.isArray(shipping)) shippingArray = shipping;
+        else if (shipping && typeof shipping === "object") shippingArray = [shipping];
+        else shippingArray = [];
+
+        if (shippingArray.length === 0) {
+            return res.json({ success: false, message: "shipping is required. Provide shipping object/array." }, 400);
         }
 
         const primaryIndex = Number.isInteger(shippingPrimaryIndex) ? shippingPrimaryIndex : 0;
         const primaryShipping = shippingArray[primaryIndex] || shippingArray[0] || {};
 
-        // Flatten shipping for indexing and required fields
+        // Flatten shipping fields
         const shipping_full_name = normalizeStr(primaryShipping.fullName || primaryShipping.full_name) || null;
         const shipping_phone = normalizeStr(primaryShipping.phone) || null;
         const shipping_line_1 = normalizeStr(primaryShipping.line1 || primaryShipping.line_1) || null;
@@ -165,96 +112,162 @@ export default async ({ req, res, log, error }) => {
         const shipping_postal_code = normalizeStr(primaryShipping.postalCode || primaryShipping.postal_code) || null;
         const shipping_country = normalizeStr(primaryShipping.country) || "India";
 
-        // Determine size: prefer existingDoc.size, else look into items array
-        let size = null;
-        if (existingDoc && (existingDoc.size || existingDoc.item_size || existingDoc.itemSize)) {
-            size = existingDoc.size || existingDoc.item_size || existingDoc.itemSize;
-        } else if (Array.isArray(items) && items.length > 0) {
+        // derive required top-level size from items or client
+        let primarySize = null;
+        if (Array.isArray(items) && items.length > 0) {
             const first = items[0];
             if (first && (first.size || first.s || first.sizeOption || first.item_size)) {
-                size = first.size || first.s || first.sizeOption || first.item_size;
+                primarySize = String(first.size || first.s || first.sizeOption || first.item_size);
             } else {
-                // try find any item with size
                 const found = items.find((it) => it && (it.size || it.s || it.sizeOption || it.item_size));
-                if (found) size = found.size || found.s || found.sizeOption || found.item_size;
+                if (found) primarySize = String(found.size || found.s || found.sizeOption || found.item_size);
             }
         }
-        if (size !== null && size !== undefined) size = String(size);
+        if (!primarySize) {
+            return res.json({ success: false, message: "size is required (e.g. send size in items[0].size)." }, 400);
+        }
 
-        // Build payload (include commonly required attributes and both camelCase/snake_case)
-        const now = new Date().toISOString();
-        const canonicalOrderId = existingDoc?.orderId || existingDoc?.order_id || razorpay_order_id || `order_${Date.now()}`;
+        if (pm === "razorpay") {
+            if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+                return res.json({ success: false, message: "Valid amount (in rupees) required for razorpay orders" }, 400);
+            }
+        }
 
-        const payload = {
-            orderId: canonicalOrderId,
-            order_id: canonicalOrderId,
+        // create razorpay order if required
+        let razorpayOrder = null;
+        let razorpay_order_id = null;
+        const amountPaiseFromClient = Math.round(Number(amount || 0) * 100);
+        let amountPaise = amountPaiseFromClient;
 
-            userId: userId || existingDoc?.userId || null,
+        if (pm === "razorpay") {
+            if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+                return res.json({ success: false, message: "Razorpay credentials not configured" }, 500);
+            }
+            const razorpay = createRazorpayClient();
+            razorpayOrder = await razorpay.orders.create({
+                amount: amountPaise,
+                currency,
+                receipt: `order_rcpt_${Date.now()}`,
+            });
+            razorpay_order_id = razorpayOrder.id;
+            amountPaise = razorpayOrder.amount;
+            log("✅ Razorpay order created:", razorpay_order_id);
+        } else {
+            // COD -> generate a canonical id for collection
+            razorpay_order_id = `cod_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+            amountPaise = amountPaiseFromClient;
+        }
 
-            // amount as provided by client (rupees) and paise if available from paymentDetails
-            amount: typeof amountFromClient !== "undefined" ? Number(amountFromClient) : existingDoc?.amount || null,
-            amountPaise: paymentDetails?.amount || existingDoc?.amountPaise || null,
+        // Create itemsForColumn (array of strings) and items_json (full JSON)
+        const itemsForColumn = Array.isArray(items)
+            ? items.map((it) => {
+                const s = stringifyItem(it);
+                return typeof s === "string" ? (s.length > TRUNCATE_ITEM ? s.slice(0, TRUNCATE_ITEM) : s) : String(s).slice(0, TRUNCATE_ITEM);
+            })
+            : [];
+        const items_json = JSON.stringify(items || []);
 
-            currency: currency || existingDoc?.currency || (paymentDetails?.currency || "INR"),
+        // shipping short string and full json
+        const shipping_short = buildShippingShort(primaryShipping) || "";
+        const shipping_json = JSON.stringify(shippingArray || []);
 
-            razorpay_order_id,
-            razorpay_payment_id,
-            razorpay_signature,
+        // Appwrite config
+        const APPWRITE_ENDPOINT = process.env.APPWRITE_ENDPOINT;
+        const APPWRITE_PROJECT_ID = process.env.APPWRITE_PROJECT_ID;
+        const APPWRITE_API_KEY = process.env.APPWRITE_API_KEY;
+        const APPWRITE_DATABASE_ID = process.env.APPWRITE_DATABASE_ID;
+        const APPWRITE_ORDERS_COLLECTION_ID = process.env.APPWRITE_ORDERS_COLLECTION_ID;
 
-            status: "paid",
-
-            items: Array.isArray(items) && items.length ? items : existingDoc?.items || [],
-
-            verification_raw: JSON.stringify({ paymentDetails }),
-
-            // shipping (must be present if collection requires it)
-            shipping: shippingArray,
-
-            // flattened shipping fields (snake_case)
-            shipping_full_name,
-            shipping_phone,
-            shipping_line_1,
-            shipping_line_2,
-            shipping_city,
-            shipping_state,
-            shipping_postal_code,
-            shipping_country,
-
-            // size fields (some collections require size)
-            size: size || existingDoc?.size || null,
-            item_size: size || existingDoc?.item_size || null,
-
-            paidAt: now,
-            // updatedAt: now,
-            // createdAt: existingDoc?.createdAt || now,
-        };
-
-        // Create or update document
-        let saved = null;
-        if (existingDoc) {
-            // Update (only send fields you want to set)
+        let savedOrderDoc = null;
+        if (APPWRITE_ENDPOINT && APPWRITE_PROJECT_ID && APPWRITE_API_KEY && APPWRITE_DATABASE_ID && APPWRITE_ORDERS_COLLECTION_ID) {
             try {
-                saved = await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, existingDoc.$id, payload);
-                log("Updated existing order doc:", existingDoc.$id);
-            } catch (updErr) {
-                error("Failed updating order doc:", updErr.message || updErr);
-                // return helpful error so client/dev can inspect
-                return res.json({ success: false, message: "Failed updating order doc", error: String(updErr) }, 500);
+                log("🔁 Initializing Appwrite client for saving order");
+                const client = new AppwriteClient().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT_ID).setKey(APPWRITE_API_KEY);
+                const databases = new Databases(client);
+
+                const canonicalOrderId = razorpay_order_id;
+                const payload = {
+                    // use order_id (snake_case) as per your collection
+                    order_id: canonicalOrderId,
+
+                    // required fields
+                    userId: userId,
+                    amount: amountPaise,
+                    amountPaise: amountPaise,
+                    currency: currency,
+
+                    // razorpay
+                    razorpay_order_id: razorpay_order_id,
+
+                    // items as array of short strings, full JSON in items_json
+                    items: itemsForColumn,
+                    items_json: items_json,
+
+                    // payment/status
+                    payment_method: pm,
+                    status: pm === "cod" ? "pending" : "created",
+
+                    // shipping: short string (fits Appwrite string col) + full json in shipping_json
+                    shipping: shipping_short,       // <-- MATCHES your current collection: string <= 999 chars
+                    shipping_json: shipping_json,   // <-- full JSON string (Text field recommended)
+
+                    // flattened fields for indexing
+                    shipping_full_name,
+                    shipping_phone,
+                    shipping_line_1,
+                    // shipping_line_2,
+                    shipping_city,
+                    shipping_postal_code,
+                    shipping_country,
+
+                    // required size
+                    size: primarySize,
+
+                    // metadata
+                    receipt: razorpayOrder?.receipt || null,
+                    verification_raw: JSON.stringify({ razorpayOrder: razorpayOrder || null }),
+                };
+
+                // Try to find existing document by razorpay_order_id to avoid duplicates
+                let existing = null;
+                try {
+                    const list = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, [
+                        Query.equal("razorpay_order_id", razorpay_order_id),
+                        Query.limit(1),
+                    ]);
+                    existing = (list?.documents || [])[0] || null;
+                } catch (qErr) {
+                    log("Query existing order failed (will create):", qErr.message || qErr);
+                }
+
+                if (existing) {
+                    log("🔄 Updating existing Appwrite order doc:", existing.$id);
+                    savedOrderDoc = await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, existing.$id, payload);
+                } else {
+                    log("➕ Creating new Appwrite order doc");
+                    savedOrderDoc = await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, ID.unique(), payload);
+                }
+
+                log("✅ Order saved to Appwrite orders collection:", savedOrderDoc.$id || savedOrderDoc.id || "(no id)");
+            } catch (dbErr) {
+                error("Error saving order to Appwrite DB:", dbErr.message || dbErr);
+                return res.json({ success: false, message: "Failed saving order to DB", error: String(dbErr) }, 500);
             }
         } else {
-            // Create
-            try {
-                saved = await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, ID.unique(), payload);
-                log("Created new order doc:", saved.$id || saved.id || "(no id returned)");
-            } catch (createErr) {
-                error("Failed creating order doc:", createErr.message || createErr);
-                return res.json({ success: false, message: "Failed creating order doc", error: String(createErr) }, 500);
-            }
+            log("ℹ️ Appwrite DB env not fully configured — skipping DB save");
         }
 
-        return res.json({ success: true, message: "Payment verified and order saved", db: saved });
+        return res.json({
+            success: true,
+            payment_method: pm,
+            razorpay_order_id: razorpay_order_id,
+            amount: amountPaise,
+            currency,
+            razorpayOrder: razorpayOrder || null,
+            savedOrderDoc: savedOrderDoc || null,
+        });
     } catch (err) {
-        error("verifyPayment error: " + (err.message || err));
-        return res.json({ success: false, message: "Unexpected error", error: String(err) }, 500);
+        error("Critical error in createOrder:", err.message || err);
+        return res.json({ success: false, error: err.message || String(err) }, 500);
     }
 };

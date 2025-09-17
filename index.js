@@ -225,8 +225,8 @@ export default async ({ req, res, log, error }) => {
             item_size: size || existingDoc?.item_size || null,
 
             paidAt: now,
-            updatedAt: now,
-            createdAt: existingDoc?.createdAt || now,
+            // updatedAt: now,
+            // createdAt: existingDoc?.createdAt || now,
         };
 
         // Create or update document

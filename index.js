@@ -1,4 +1,4 @@
-// verifyPayment.js - hardened + env-driven (no hardcoded secrets)
+// verifyPayment.js - patched: robust amount handling (accepts amountPaise or rupees)
 import Razorpay from "razorpay";
 import { Client, Databases, Query, ID } from "node-appwrite";
 import crypto from "crypto";
@@ -72,7 +72,8 @@ export default async ({ req, res, log, error }) => {
             razorpay_signature,
             userId,
             items,
-            amount,
+            amount,        // may be rupees OR paise depending on client
+            amountPaise,   // optional explicit paise (preferred)
             currency = "INR",
         } = bodyData || {};
 
@@ -116,12 +117,48 @@ export default async ({ req, res, log, error }) => {
             // continue — because signature verification is primary; but we still attempt to save.
         }
 
-        // Optional amount check: compare paise
-        if (typeof amount !== "undefined" && paymentDetails?.amount !== undefined) {
-            const expectedPaise = Math.round(Number(amount) * 100);
-            if (Number(paymentDetails.amount) !== expectedPaise) {
-                log("Amount mismatch", { expectedPaise, actual: paymentDetails.amount });
-                return res.json({ success: false, message: "Payment amount mismatch" }, 400);
+        // Robust amount check:
+        // Priority:
+        // 1) If client provided explicit amountPaise -> use it
+        // 2) Else if client provided amount and it looks like paise (integer >= 100) -> treat as paise
+        // 3) Else treat amount as rupees and convert to paise
+        if (typeof amountPaise !== "undefined" || typeof amount !== "undefined") {
+            let expectedPaise = null;
+
+            if (typeof amountPaise !== "undefined") {
+                // if client explicitly sends amountPaise, use it (trust but still numeric)
+                const ap = Number(amountPaise);
+                if (!Number.isFinite(ap) || ap <= 0) {
+                    log("Invalid amountPaise provided", { amountPaise });
+                    return res.json({ success: false, message: "Invalid amountPaise provided" }, 400);
+                }
+                expectedPaise = Math.round(ap);
+            } else {
+                // amount provided but ambiguous: decide if it's paise or rupees
+                const amtNum = Number(amount);
+                if (!Number.isFinite(amtNum)) {
+                    log("Invalid amount provided", { amount });
+                    return res.json({ success: false, message: "Invalid amount provided" }, 400);
+                }
+
+                // Heuristic:
+                // - If amount is an integer and >= 100 -> likely paise (e.g. 149900)
+                // - Else treat as rupees and multiply by 100
+                if (Number.isInteger(amtNum) && Math.abs(amtNum) >= 100) {
+                    expectedPaise = Math.round(amtNum);
+                } else {
+                    expectedPaise = Math.round(amtNum * 100);
+                }
+            }
+
+            if (paymentDetails?.amount !== undefined && expectedPaise !== null) {
+                if (Number(paymentDetails.amount) !== expectedPaise) {
+                    log("Amount mismatch", { expectedPaise, actual: paymentDetails.amount });
+                    return res.json({ success: false, message: "Payment amount mismatch" }, 400);
+                }
+            } else {
+                // couldn't compare (missing payment details), continue
+                log("Amount check skipped (missing payment details or expectedPaise)", { expectedPaise, paymentDetailsPresent: !!paymentDetails });
             }
         }
 
@@ -132,8 +169,9 @@ export default async ({ req, res, log, error }) => {
         // Build payload to store/update in DB
         const verificationPayload = {
             userId: userId || null,
+            // prefer explicit amountPaise if provided, else use paymentDetails amount
             amount: typeof amount !== "undefined" ? Number(amount) : null,
-            amountPaise: paymentDetails?.amount ?? null,
+            amountPaise: (typeof amountPaise !== "undefined" ? Number(amountPaise) : (paymentDetails?.amount ?? null)),
             currency,
             razorpay_order_id,
             razorpay_payment_id,
@@ -165,7 +203,6 @@ export default async ({ req, res, log, error }) => {
         const client = new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT);
         if (req.headers?.["x-appwrite-key"]) client.setKey(req.headers["x-appwrite-key"]);
         else if (process.env.APPWRITE_API_KEY) client.setKey(process.env.APPWRITE_API_KEY); // allow env key
-        // else we proceed but Appwrite calls will fail — will be caught below
 
         const databases = new Databases(client);
 
